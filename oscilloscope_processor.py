@@ -100,24 +100,71 @@ def calculate_optimal_decimation(total_points, min_lines=50000, max_lines=100000
 
 
 def read_csv_file(filepath):
-    """Lit un fichier CSV d'oscilloscope"""
-    encodings = ['utf-8', 'latin-1', 'cp1252']
-    separators = [',', ';', '\t']
+    """
+    Lit un fichier CSV d'oscilloscope avec en-têtes multiples.
+    Gère les fichiers Siglent SDS1204X avec métadonnées.
+    """
+    # Lire les premières lignes pour détecter le format
+    with open(filepath, 'r', encoding='utf-8') as f:
+        lines = []
+        for i, line in enumerate(f):
+            lines.append(line)
+            if i > 30:  # Lire suffisamment de lignes
+                break
     
-    for encoding in encodings:
-        for sep in separators:
-            try:
-                df = pd.read_csv(filepath, encoding=encoding, sep=sep, skiprows=0)
-                if len(df.columns) >= 2:
-                    return df, sep, encoding
-            except Exception:
-                continue
+    # Trouver où commencent les données
+    data_start_line = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Chercher la ligne d'en-tête avec "Second" ou "Time"
+        if 'Second' in line or 'Time' in line:
+            data_start_line = i + 1
+            break
+        # Ou chercher une ligne qui commence par un nombre négatif (données scientifiques)
+        if stripped.startswith('-') and ',' in stripped:
+            data_start_line = i
+            break
     
+    # Essayer de lire avec pandas en sautant les lignes d'en-tête
     try:
-        df = pd.read_csv(filepath, engine='python')
-        return df, ',', 'utf-8'
-    except Exception as e:
-        raise Exception(f"Impossible de lire le fichier {filepath}: {str(e)}")
+        df = pd.read_csv(
+            filepath,
+            skiprows=data_start_line,
+            header=None,
+            names=['Time', 'Voltage'],
+            usecols=[0, 1],
+            engine='c'
+        )
+    except Exception:
+        try:
+            df = pd.read_csv(
+                filepath,
+                skiprows=data_start_line,
+                header=None,
+                names=['Time', 'Voltage'],
+                usecols=[0, 1],
+                engine='python'
+            )
+        except Exception:
+            # Lecture manuelle en dernier recours
+            times = []
+            voltages = []
+            with open(filepath, 'r', encoding='utf-8') as f:
+                for i, line in enumerate(f):
+                    if i < data_start_line:
+                        continue
+                    parts = line.strip().split(',')
+                    if len(parts) >= 2:
+                        try:
+                            t = float(parts[0])
+                            v = float(parts[1])
+                            times.append(t)
+                            voltages.append(v)
+                        except ValueError:
+                            continue
+            df = pd.DataFrame({'Time': times, 'Voltage': voltages})
+    
+    return df, ',', 'utf-8'
 
 
 def decimate_data(df, decimation_factor):
