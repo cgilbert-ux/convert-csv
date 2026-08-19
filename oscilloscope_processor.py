@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Programme de traitement de traces d'oscilloscope
+Programme de traitement de traces d'oscilloscope - Interface GUI complète
 - Sélection de 1 à 4 fichiers CSV (C1, C2, C3, C4)
 - Décimation automatique ou manuelle des données
 - Export vers Excel avec graphique
 - Sauvegarde du paramètre de décimation dans un fichier INI
+- Interface entièrement graphique avec barre de progression
 """
 
 import os
-import sys
 import re
 import configparser
 from pathlib import Path
+import threading
 
 import pandas as pd
 import numpy as np
-from tkinter import filedialog, Tk, messagebox, Toplevel, Label, Entry, Button, Frame
-from tqdm import tqdm
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from openpyxl import Workbook
+from openpyxl.chart import LineChart, Reference, Series
+from openpyxl.styles import Font, Alignment
 
 
 def get_ini_path():
-    """Retourne le chemin du fichier INI (dans le même dossier que le script)"""
+    """Retourne le chemin du fichier INI"""
     script_dir = Path(__file__).parent.resolve()
     return script_dir / "oscilloscope_config.ini"
 
@@ -58,85 +62,10 @@ def save_decimation_to_ini(decimation):
         config.write(f)
 
 
-def ask_decimation_dialog(current_decimation=None):
-    """Affiche une boîte de dialogue pour saisir le facteur de décimation"""
-    root = Tk()
-    root.withdraw()
-    root.attributes('-topmost', True)
-    
-    dialog = Tk()
-    dialog.title("Facteur de décimation")
-    dialog.attributes('-topmost', True)
-    
-    label = tk.Label(dialog, text="Entrez le facteur de décimation:")
-    label.pack(padx=20, pady=10)
-    
-    entry = tk.Entry(dialog, width=20)
-    if current_decimation is not None:
-        entry.insert(0, str(current_decimation))
-    entry.pack(padx=20, pady=10)
-    
-    result = {'value': None}
-    
-    def on_ok():
-        try:
-            val = int(entry.get())
-            if val >= 1:
-                result['value'] = val
-                dialog.destroy()
-            else:
-                messagebox.showerror("Erreur", "La décimation doit être >= 1")
-        except ValueError:
-            messagebox.showerror("Erreur", "Veuillez entrer un nombre entier valide")
-    
-    def on_cancel():
-        result['value'] = None
-        dialog.destroy()
-    
-    btn_frame = tk.Frame(dialog)
-    btn_frame.pack(pady=10)
-    
-    tk.Button(btn_frame, text="OK", command=on_ok).pack(side=tk.LEFT, padx=5)
-    tk.Button(btn_frame, text="Annuler", command=on_cancel).pack(side=tk.LEFT, padx=5)
-    
-    dialog.bind('<Return>', lambda e: on_ok())
-    dialog.bind('<Escape>', lambda e: on_cancel())
-    
-    dialog.mainloop()
-    root.destroy()
-    
-    return result['value']
-
-
-def select_csv_files():
-    """Affiche une boîte de dialogue pour sélectionner 1 à 4 fichiers CSV"""
-    root = Tk()
-    root.withdraw()
-    root.attributes('-topmost', True)
-    
-    files = filedialog.askopenfilenames(
-        title="Sélectionnez 1 à 4 fichiers CSV (traces d'oscilloscope)",
-        filetypes=[("Fichiers CSV", "*.csv"), ("Tous les fichiers", "*.*")],
-        multiple=True
-    )
-    
-    root.destroy()
-    
-    if len(files) == 0:
-        return []
-    
-    if len(files) > 4:
-        messagebox.showerror("Erreur", "Vous ne pouvez sélectionner que 1 à 4 fichiers maximum.")
-        return []
-    
-    return list(files)
-
-
 def extract_channel_info(filepath):
     """Extrait les informations de canal depuis le nom du fichier"""
     filename = os.path.basename(filepath)
     
-    # Recherche de motifs comme C1, C2, C3, C4 (case insensitive)
     match = re.search(r'C([1-4])', filename, re.IGNORECASE)
     if match:
         channel_num = int(match.group(1))
@@ -145,7 +74,6 @@ def extract_channel_info(filepath):
         channel_num = None
         channel_name = "Trace"
     
-    # Nom de base sans information de canal
     base_name = re.sub(r'_?C[1-4]', '', filename, flags=re.IGNORECASE)
     base_name = re.sub(r'\.csv$', '', base_name, flags=re.IGNORECASE)
     
@@ -161,13 +89,10 @@ def calculate_optimal_decimation(total_points, min_lines=50000, max_lines=100000
     if total_points <= max_lines:
         return 1
     
-    # On vise environ 75000 lignes (milieu de la plage)
     target_lines = (min_lines + max_lines) // 2
     decimation = max(1, total_points // target_lines)
     
-    # Vérifier que le résultat est dans la plage acceptable
     resulting_lines = total_points // decimation
-    
     if resulting_lines < min_lines and decimation > 1:
         decimation -= 1
     
@@ -175,24 +100,21 @@ def calculate_optimal_decimation(total_points, min_lines=50000, max_lines=100000
 
 
 def read_csv_file(filepath):
-    """Lit un fichier CSV d'oscilloscope et retourne un DataFrame"""
-    # Essayer différents encodages et séparateurs
+    """Lit un fichier CSV d'oscilloscope"""
     encodings = ['utf-8', 'latin-1', 'cp1252']
     separators = [',', ';', '\t']
     
     for encoding in encodings:
         for sep in separators:
             try:
-                df = pd.read_csv(filepath, encoding=encoding, sep=sep, 
-                               skiprows=0, low_memory=False)
+                df = pd.read_csv(filepath, encoding=encoding, sep=sep, skiprows=0)
                 if len(df.columns) >= 2:
                     return df, sep, encoding
             except Exception:
                 continue
     
-    # Si échec, essayer sans spécifier l'encodage
     try:
-        df = pd.read_csv(filepath, low_memory=False, engine='python')
+        df = pd.read_csv(filepath, engine='python')
         return df, ',', 'utf-8'
     except Exception as e:
         raise Exception(f"Impossible de lire le fichier {filepath}: {str(e)}")
@@ -202,214 +124,178 @@ def decimate_data(df, decimation_factor):
     """Réduit le nombre de points par décimation"""
     if decimation_factor <= 1:
         return df
-    
-    # Prendre un point sur N
-    decimated_df = df.iloc[::decimation_factor].reset_index(drop=True)
-    return decimated_df
+    return df.iloc[::decimation_factor].reset_index(drop=True)
 
 
-def create_excel_with_chart(data_dict, output_path, progress_callback=None):
-    """Crée un fichier Excel avec les données et un graphique"""
-    from openpyxl import Workbook
-    from openpyxl.chart import LineChart, Reference
-    from openpyxl.styles import Font, Alignment
-    from openpyxl.utils.dataframe import dataframe_to_rows
+class OscilloscopeApp:
+    """Application GUI principale"""
     
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Données"
-    
-    # En-têtes
-    channels = list(data_dict.keys())
-    headers = ["Point"] + [f"{ch['channel_name']} (V)" for ch in channels]
-    
-    if data_dict:
-        first_channel = channels[0]
-        time_data = data_dict[first_channel]['time']
-    else:
-        time_data = []
-    
-    # Écriture des en-têtes
-    for col, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col, value=header)
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal='center')
-    
-    total_rows = len(time_data) if time_data is not None else 0
-    
-    # Écriture des données avec barre de progression
-    for row_idx in tqdm(range(total_rows), desc="Écriture des données Excel", 
-                       ncols=100, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}'):
-        ws.cell(row=row_idx + 2, column=1, value=time_data[row_idx] if row_idx < len(time_data) else None)
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Traitement de traces d'oscilloscope")
+        self.root.geometry("700x500")
+        self.root.resizable(True, True)
         
-        for col_idx, channel in enumerate(channels, 2):
-            voltage_data = data_dict[channel]['voltage']
-            value = voltage_data[row_idx] if row_idx < len(voltage_data) else None
-            ws.cell(row=row_idx + 2, column=col_idx, value=value)
+        self.selected_files = []
+        self.decimation_value = tk.IntVar()
+        self.processing = False
         
-        if progress_callback and row_idx % 1000 == 0:
-            progress_callback(row_idx, total_rows)
-    
-    # Création du graphique
-    chart = LineChart()
-    chart.title = "Traces d'oscilloscope"
-    chart.style = 13
-    chart.y_axis.title = 'Tension (V)'
-    chart.x_axis.title = 'Point de mesure'
-    chart.width = 20
-    chart.height = 10
-    
-    # Ajout des séries pour chaque voie
-    for col_idx, channel in enumerate(channels, 2):
-        values = Reference(ws, min_col=col_idx, min_row=2, max_row=total_rows + 1)
-        series_name = ws.cell(row=1, column=col_idx).value
-        series = Series(values, from_series=series_name)
-        chart.series.append(series)
-    
-    ws.add_chart(chart, "E2")
-    
-    wb.save(output_path)
-    return True
-
-
-class SimpleProgressBar:
-    """Barre de progression simple pour console"""
-    def __init__(self, total, desc="Progression"):
-        self.total = total
-        self.desc = desc
-        self.current = 0
-    
-    def update(self, current, total=None):
-        if total:
-            self.total = total
-        self.current = current
-        percent = (self.current / self.total * 100) if self.total > 0 else 0
-        bar_length = 40
-        filled = int(bar_length * self.current / self.total) if self.total > 0 else 0
-        bar = '█' * filled + '-' * (bar_length - filled)
-        print(f"\r{self.desc}: [{bar}] {percent:.1f}% ({current}/{total})", end='', flush=True)
-        if self.current >= self.total:
-            print()
-
-
-def main():
-    """Fonction principale"""
-    import tkinter as tk
-    
-    print("=" * 60)
-    print("Traitement de traces d'oscilloscope")
-    print("=" * 60)
-    
-    # Étape 1: Sélection des fichiers
-    print("\n[Sélection des fichiers]")
-    csv_files = select_csv_files()
-    
-    if not csv_files:
-        print("Aucun fichier sélectionné. Abandon.")
-        return
-    
-    print(f"{len(csv_files)} fichier(s) sélectionné(s):")
-    for f in csv_files:
-        print(f"  - {os.path.basename(f)}")
-    
-    # Étape 2: Charger la décimation depuis INI
-    saved_decimation = load_decimation_from_ini()
-    
-    # Étape 3: Demander confirmation/modification de la décimation
-    print("\n[Configuration de la décimation]")
-    
-    # D'abord, lire un fichier pour connaître le nombre de points
-    try:
-        sample_df, _, _ = read_csv_file(csv_files[0])
-        total_points = len(sample_df)
-        print(f"Nombre de points dans le premier fichier: {total_points:,}")
+        self.setup_ui()
         
-        # Calculer la décimation automatique
-        auto_decimation = calculate_optimal_decimation(total_points)
-        print(f"Décimation automatique recommandée: {auto_decimation}")
-        print(f"  -> Nombre de points résultant: {total_points // auto_decimation:,}")
+        # Charger la décimation sauvegardée
+        saved_dec = load_decimation_from_ini()
+        if saved_dec:
+            self.decimation_value.set(saved_dec)
+    
+    def setup_ui(self):
+        """Configure l'interface utilisateur"""
+        # Frame principal
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
         
-        # Utiliser la valeur sauvegardée ou la valeur automatique
-        initial_decimation = saved_decimation if saved_decimation else auto_decimation
+        # Titre
+        title_label = ttk.Label(main_frame, text="Traitement de traces d'oscilloscope", 
+                               font=('Arial', 14, 'bold'))
+        title_label.grid(row=0, column=0, columnspan=2, pady=(0, 20))
         
-    except Exception as e:
-        print(f"Erreur lors de la lecture du fichier: {e}")
-        initial_decimation = saved_decimation if saved_decimation else 100
+        # Section sélection de fichiers
+        file_frame = ttk.LabelFrame(main_frame, text="Fichiers CSV", padding="10")
+        file_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        file_frame.columnconfigure(1, weight=1)
+        
+        ttk.Button(file_frame, text="Sélectionner 1-4 fichiers", 
+                  command=self.select_files).grid(row=0, column=0, padx=(0, 10))
+        
+        self.file_list_text = tk.Text(file_frame, height=6, width=60)
+        self.file_list_text.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(5, 0))
+        
+        self.files_count_label = ttk.Label(file_frame, text="Aucun fichier sélectionné")
+        self.files_count_label.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
+        
+        # Section décimation
+        decim_frame = ttk.LabelFrame(main_frame, text="Décimation", padding="10")
+        decim_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        ttk.Label(decim_frame, text="Facteur de décimation:").grid(row=0, column=0, padx=(0, 10))
+        
+        self.decim_entry = ttk.Entry(decim_frame, textvariable=self.decimation_value, width=10)
+        self.decim_entry.grid(row=0, column=1, sticky=tk.W)
+        
+        ttk.Button(decim_frame, text="Calcul automatique", 
+                  command=self.calc_auto_decimation).grid(row=0, column=2, padx=(10, 0))
+        
+        self.decim_info_label = ttk.Label(decim_frame, text="")
+        self.decim_info_label.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(5, 0))
+        
+        # Section progression
+        progress_frame = ttk.LabelFrame(main_frame, text="Progression", padding="10")
+        progress_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        progress_frame.columnconfigure(0, weight=1)
+        
+        self.progress_bar = ttk.Progressbar(progress_frame, mode='indeterminate', length=400)
+        self.progress_bar.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
+        
+        self.status_label = ttk.Label(progress_frame, text="Prêt")
+        self.status_label.grid(row=1, column=0, sticky=tk.W)
+        
+        # Boutons d'action
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.grid(row=4, column=0, columnspan=2, pady=(10, 0))
+        
+        ttk.Button(btn_frame, text="Traiter les fichiers", 
+                  command=self.start_processing).grid(row=0, column=0, padx=(0, 10))
+        
+        ttk.Button(btn_frame, text="Quitter", 
+                  command=self.root.quit).grid(row=0, column=1)
     
-    # Boîte de dialogue pour la décimation
-    root = Tk()
-    root.withdraw()
-    root.attributes('-topmost', True)
+    def select_files(self):
+        """Sélectionne les fichiers CSV"""
+        files = filedialog.askopenfilenames(
+            title="Sélectionnez 1 à 4 fichiers CSV",
+            filetypes=[("Fichiers CSV", "*.csv"), ("Tous les fichiers", "*.*")]
+        )
+        
+        if len(files) > 4:
+            messagebox.showerror("Erreur", "Maximum 4 fichiers autorisés")
+            return
+        
+        self.selected_files = list(files)
+        
+        self.file_list_text.delete(1.0, tk.END)
+        for f in self.selected_files:
+            self.file_list_text.insert(tk.END, f"  • {os.path.basename(f)}\n")
+        
+        count = len(self.selected_files)
+        self.files_count_label.config(text=f"{count} fichier(s) sélectionné(s)")
+        
+        # Mettre à jour la décimation automatique
+        if count > 0:
+            self.calc_auto_decimation()
     
-    dialog = Toplevel(root)
-    dialog.title("Facteur de décimation")
-    dialog.attributes('-topmost', True)
-    
-    label = tk.Label(dialog, text=f"Entrez le facteur de décimation:\n(Recommandé: {initial_decimation})")
-    label.pack(padx=20, pady=10)
-    
-    entry = tk.Entry(dialog, width=20)
-    entry.insert(0, str(initial_decimation))
-    entry.pack(padx=20, pady=10)
-    
-    result = {'value': None}
-    
-    def on_ok():
+    def calc_auto_decimation(self):
+        """Calcule la décimation automatique"""
+        if not self.selected_files:
+            messagebox.showwarning("Attention", "Sélectionnez d'abord des fichiers")
+            return
+        
         try:
-            val = int(entry.get())
-            if val >= 1:
-                result['value'] = val
-                dialog.destroy()
-            else:
-                messagebox.showerror("Erreur", "La décimation doit être >= 1")
-        except ValueError:
-            messagebox.showerror("Erreur", "Veuillez entrer un nombre entier valide")
-    
-    def on_auto():
-        entry.delete(0, tk.END)
-        entry.insert(0, str(initial_decimation))
-    
-    def on_cancel():
-        result['value'] = initial_decimation
-        dialog.destroy()
-    
-    btn_frame = tk.Frame(dialog)
-    btn_frame.pack(pady=10)
-    
-    tk.Button(btn_frame, text="Automatique", command=on_auto).pack(side=tk.LEFT, padx=5)
-    tk.Button(btn_frame, text="OK", command=on_ok).pack(side=tk.LEFT, padx=5)
-    tk.Button(btn_frame, text="Annuler", command=on_cancel).pack(side=tk.LEFT, padx=5)
-    
-    dialog.bind('<Return>', lambda e: on_ok())
-    dialog.bind('<Escape>', lambda e: on_cancel())
-    
-    dialog.mainloop()
-    root.destroy()
-    
-    decimation_factor = result['value'] if result['value'] else initial_decimation
-    
-    # Sauvegarder dans INI
-    save_decimation_to_ini(decimation_factor)
-    print(f"Décimation utilisée: {decimation_factor}")
-    print(f"Paramètre sauvegardé dans: {get_ini_path()}")
-    
-    # Étape 4: Lecture et traitement des fichiers
-    print("\n[Lecture et décimation des fichiers]")
-    
-    channel_data = {}
-    
-    for filepath in tqdm(csv_files, desc="Lecture des fichiers", ncols=100):
-        try:
-            df, sep, encoding = read_csv_file(filepath)
-            channel_info = extract_channel_info(filepath)
+            df, _, _ = read_csv_file(self.selected_files[0])
+            total_points = len(df)
+            auto_dec = calculate_optimal_decimation(total_points)
             
-            # Identifier les colonnes (temps et tension)
-            if len(df.columns) >= 2:
-                time_col = df.columns[0]
-                voltage_col = df.columns[1]
+            self.decimation_value.set(auto_dec)
+            result_lines = total_points // auto_dec
+            
+            self.decim_info_label.config(
+                text=f"Fichier: {total_points:,} points → Décimation: {auto_dec} → {result_lines:,} lignes"
+            )
+        except Exception as e:
+            messagebox.showerror("Erreur", f"Impossible de lire le fichier: {e}")
+    
+    def start_processing(self):
+        """Démarre le traitement dans un thread"""
+        if not self.selected_files:
+            messagebox.showwarning("Attention", "Sélectionnez des fichiers d'abord")
+            return
+        
+        if self.processing:
+            messagebox.showwarning("Attention", "Traitement en cours...")
+            return
+        
+        self.processing = True
+        self.progress_bar.config(mode='indeterminate')
+        self.progress_bar.start(10)
+        
+        thread = threading.Thread(target=self.process_files)
+        thread.daemon = True
+        thread.start()
+    
+    def process_files(self):
+        """Traite les fichiers (dans un thread)"""
+        try:
+            decimation = self.decimation_value.get()
+            if decimation < 1:
+                decimation = 1
+            
+            # Sauvegarder la décimation
+            save_decimation_to_ini(decimation)
+            
+            self.update_status("Lecture des fichiers...")
+            
+            channel_data = {}
+            
+            for i, filepath in enumerate(self.selected_files):
+                self.update_status(f"Lecture ({i+1}/{len(self.selected_files)}): {os.path.basename(filepath)}")
                 
-                # Décimation
-                df_decimated = decimate_data(df, decimation_factor)
+                df, _, _ = read_csv_file(filepath)
+                channel_info = extract_channel_info(filepath)
+                
+                df_decimated = decimate_data(df, decimation)
+                
+                time_col = df_decimated.columns[0]
+                voltage_col = df_decimated.columns[1]
                 
                 channel_key = f"C{channel_info['channel_num']}" if channel_info['channel_num'] else filepath
                 
@@ -419,119 +305,107 @@ def main():
                     'channel_info': channel_info,
                     'original_file': filepath
                 }
-                
-                print(f"  {os.path.basename(filepath)}: {len(df)} -> {len(df_decimated)} points")
-                
+            
+            if not channel_data:
+                self.update_status("Aucune donnée traitée")
+                self.processing = False
+                self.progress_bar.stop()
+                return
+            
+            # Générer le nom de fichier Excel
+            first_ch = list(channel_data.values())[0]
+            base_name = first_ch['channel_info']['base_name']
+            base_name = re.sub(r'[^\w\-_]', '_', base_name)
+            base_name = re.sub(r'_+', '_', base_name).strip('_')
+            
+            if not base_name:
+                base_name = "oscilloscope_data"
+            
+            output_filename = f"{base_name}_traces.xlsx"
+            output_path = os.path.join(os.path.dirname(self.selected_files[0]), output_filename)
+            
+            self.update_status(f"Création Excel: {output_filename}...")
+            
+            # Créer le fichier Excel
+            self.create_excel(channel_data, output_path)
+            
+            self.update_status(f"Terminé! Fichier créé: {output_filename}")
+            self.progress_bar.stop()
+            
+            messagebox.showinfo("Succès", f"Fichier Excel créé:\n{output_filename}\n\n{len(channel_data)} trace(s) exportée(s)")
+            
         except Exception as e:
-            print(f"Erreur lors du traitement de {filepath}: {e}")
-            continue
+            self.update_status(f"Erreur: {e}")
+            self.progress_bar.stop()
+            messagebox.showerror("Erreur", str(e))
+        finally:
+            self.processing = False
     
-    if not channel_data:
-        print("Aucune donnée traitée avec succès. Abandon.")
-        return
-    
-    # Étape 5: Génération du nom de fichier Excel
-    first_channel = list(channel_data.values())[0]
-    base_name = first_channel['channel_info']['base_name']
-    
-    # Nettoyer le nom de base
-    base_name = re.sub(r'[^\w\-_]', '_', base_name)
-    base_name = re.sub(r'_+', '_', base_name)
-    base_name = base_name.strip('_')
-    
-    if not base_name:
-        base_name = "oscilloscope_data"
-    
-    output_filename = f"{base_name}_traces.xlsx"
-    output_path = os.path.join(os.path.dirname(csv_files[0]), output_filename)
-    
-    print(f"\n[Création du fichier Excel]")
-    print(f"Nom du fichier: {output_filename}")
-    
-    # Étape 6: Création du fichier Excel avec graphique
-    from openpyxl import Workbook
-    from openpyxl.chart import LineChart, Reference, Series
-    from openpyxl.styles import Font, Alignment
-    from openpyxl.utils.dataframe import dataframe_to_rows
-    
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Données"
-    
-    # Préparer les données
-    channels_list = list(channel_data.keys())
-    first_channel_data = channel_data[channels_list[0]]
-    time_data = first_channel_data['time']
-    
-    # En-têtes
-    headers = ["Point"]
-    for ch_key in channels_list:
-        ch_info = channel_data[ch_key]['channel_info']
-        headers.append(f"{ch_info['channel_name']} (V)")
-    
-    print("Écriture des en-têtes...")
-    for col, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col, value=header)
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal='center')
-    
-    # Écriture des données avec barre de progression
-    total_rows = len(time_data)
-    print(f"Écriture de {total_rows:,} lignes de données...")
-    
-    progress_bar = SimpleProgressBar(total_rows, "Progression")
-    
-    for row_idx in range(total_rows):
-        ws.cell(row=row_idx + 2, column=1, value=float(time_data[row_idx]))
+    def create_excel(self, channel_data, output_path):
+        """Crée le fichier Excel avec graphique"""
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Données"
         
-        for col_idx, ch_key in enumerate(channels_list, 2):
-            voltage_data = channel_data[ch_key]['voltage']
-            if row_idx < len(voltage_data):
-                try:
-                    value = float(voltage_data[row_idx])
-                except (ValueError, TypeError):
-                    value = None
-            else:
-                value = None
-            ws.cell(row=row_idx + 2, column=col_idx, value=value)
+        channels_list = list(channel_data.keys())
+        first_ch_data = channel_data[channels_list[0]]
+        time_data = first_ch_data['time']
         
-        if row_idx % 1000 == 0:
-            progress_bar.update(row_idx, total_rows)
+        # En-têtes
+        headers = ["Point"]
+        for ch_key in channels_list:
+            ch_info = channel_data[ch_key]['channel_info']
+            headers.append(f"{ch_info['channel_name']} (V)")
+        
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal='center')
+        
+        # Écriture des données
+        total_rows = len(time_data)
+        
+        for row_idx in range(total_rows):
+            ws.cell(row=row_idx + 2, column=1, value=time_data[row_idx])
+            
+            for col_idx, ch_key in enumerate(channels_list, 2):
+                voltage = channel_data[ch_key]['voltage'][row_idx]
+                ws.cell(row=row_idx + 2, column=col_idx, value=voltage)
+            
+            # Mise à jour de la progression tous les 1000 points
+            if row_idx % 1000 == 0:
+                pct = int((row_idx / total_rows) * 100)
+                self.update_status(f"Écriture Excel: {pct}%")
+        
+        # Création du graphique
+        chart = LineChart()
+        chart.title = "Traces d'oscilloscope"
+        chart.style = 13
+        chart.y_axis.title = 'Tension (V)'
+        chart.x_axis.title = 'Point de mesure'
+        chart.width = 20
+        chart.height = 10
+        
+        for col_idx in range(2, len(channels_list) + 2):
+            values = Reference(ws, min_col=col_idx, min_row=2, max_row=total_rows + 1)
+            series_name = ws.cell(row=1, column=col_idx).value
+            series = Series(values, from_series=series_name)
+            chart.series.append(series)
+        
+        ws.add_chart(chart, "E2")
+        
+        wb.save(output_path)
     
-    progress_bar.update(total_rows, total_rows)
-    
-    # Création du graphique
-    print("Création du graphique...")
-    chart = LineChart()
-    chart.title = "Traces d'oscilloscope"
-    chart.style = 13
-    chart.y_axis.title = 'Tension (V)'
-    chart.x_axis.title = 'Point de mesure'
-    chart.width = 20
-    chart.height = 10
-    
-    # Ajout des séries pour chaque voie
-    for col_idx, ch_key in enumerate(channels_list, 2):
-        ch_info = channel_data[ch_key]['channel_info']
-        values = Reference(ws, min_col=col_idx, min_row=2, max_row=total_rows + 1)
-        series = Series(values, title=ch_info['channel_name'])
-        chart.series.append(series)
-    
-    ws.add_chart(chart, "E2")
-    
-    # Sauvegarde
-    print(f"Sauvegarde dans {output_path}...")
-    wb.save(output_path)
-    
-    print("\n" + "=" * 60)
-    print("TRAITEMENT TERMINÉ AVEC SUCCÈS")
-    print("=" * 60)
-    print(f"Fichier Excel créé: {output_path}")
-    print(f"Nombre de traces: {len(channels_list)}")
-    print(f"Nombre de points après décimation: {total_rows:,}")
-    print(f"Facteur de décimation: {decimation_factor}")
-    print(f"Configurations sauvegardées dans: {get_ini_path()}")
-    print("=" * 60)
+    def update_status(self, message):
+        """Met à jour le statut (thread-safe)"""
+        self.root.after(0, lambda: self.status_label.config(text=message))
+
+
+def main():
+    """Point d'entrée principal"""
+    root = tk.Tk()
+    app = OscilloscopeApp(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
