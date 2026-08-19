@@ -1,0 +1,1 @@
+Nothing should be ignored in this case, as the changes only include source/config files (.ini and .py) without any build artifacts, dependencies, or temporary files.
